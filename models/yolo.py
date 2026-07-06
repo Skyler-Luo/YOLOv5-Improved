@@ -23,6 +23,7 @@ if platform.system() != 'Windows':
 
 from models.common import *  # noqa
 from models.experimental import *  # noqa
+from models.attention import *  # noqa
 from utils.autoanchor import check_anchor_order
 from utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args
 from utils.plots import feature_visualization
@@ -104,6 +105,64 @@ class Segment(Detect):
         p = self.proto(x[0])
         x = self.detect(self, x)
         return (x, p) if self.training else (x[0], p) if self.export else (x[0], p, x[1])
+
+
+class Decoupled_Detect(Detect):
+    # Decoupled Detect head for YOLOv5
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):
+        super().__init__(nc, anchors, ch, inplace)
+        self.cls_convs = nn.ModuleList()
+        self.reg_convs = nn.ModuleList()
+        self.cls_preds = nn.ModuleList()
+        self.reg_preds = nn.ModuleList()
+        self.obj_preds = nn.ModuleList()
+        self.stems = nn.ModuleList()
+
+        for x in ch:
+            self.stems.append(Conv(x, x, 1, 1))
+            self.cls_convs.append(nn.Sequential(
+                Conv(x, x, 3, 1),
+                Conv(x, x, 3, 1)
+            ))
+            self.reg_convs.append(nn.Sequential(
+                Conv(x, x, 3, 1),
+                Conv(x, x, 3, 1)
+            ))
+            self.cls_preds.append(nn.Conv2d(x, self.na * self.nc, 1))
+            self.reg_preds.append(nn.Conv2d(x, self.na * 4, 1))
+            self.obj_preds.append(nn.Conv2d(x, self.na * 1, 1))
+
+    def forward(self, x):
+        z = []
+        for i in range(self.nl):
+            xi = self.stems[i](x[i])
+            cls_feat = self.cls_convs[i](xi)
+            reg_feat = self.reg_convs[i](xi)
+            cls_out = self.cls_preds[i](cls_feat)
+            reg_out = self.reg_preds[i](reg_feat)
+            obj_out = self.obj_preds[i](reg_feat)
+
+            bs, _, ny, nx = cls_out.shape
+            cls_out = cls_out.view(bs, self.na, self.nc, ny, nx)
+            reg_out = reg_out.view(bs, self.na, 4, ny, nx)
+            obj_out = obj_out.view(bs, self.na, 1, ny, nx)
+
+            y_i = torch.cat([reg_out, obj_out, cls_out], dim=2)
+            x[i] = y_i.permute(0, 1, 3, 4, 2).contiguous()
+
+            if not self.training:
+                if self.dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
+                    self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
+
+                if self.export:
+                    y = x[i].sigmoid()
+                else:
+                    y = x[i].sigmoid()
+                    y[..., 0:2] = (y[..., 0:2] * 2 + self.grid[i]) * self.stride[i]
+                    y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]
+                z.append(y.view(bs, self.na * nx * ny, self.no))
+
+        return x if self.training else (torch.cat(z, 1), ) if self.export else (torch.cat(z, 1), x)
 
 
 class BaseModel(nn.Module):
@@ -254,6 +313,15 @@ class DetectionModel(BaseModel):
         # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
         m = self.model[-1]  # Detect() module
+        if isinstance(m, Decoupled_Detect):
+            for i, s in enumerate(m.stride):
+                b_obj = m.obj_preds[i].bias.view(m.na, -1)
+                b_obj.data += math.log(8 / (640 / s) ** 2)
+                m.obj_preds[i].bias = torch.nn.Parameter(b_obj.view(-1), requires_grad=True)
+                b_cls = m.cls_preds[i].bias.view(m.na, -1)
+                b_cls.data += math.log(0.6 / (m.nc - 0.99999)) if cf is None else torch.log(cf / cf.sum())
+                m.cls_preds[i].bias = torch.nn.Parameter(b_cls.view(-1), requires_grad=True)
+            return
         for mi, s in zip(m.m, m.stride):  # from
             b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
             b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
@@ -316,21 +384,33 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in {
                 Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, C3_Faster, GSConvns, VoVGSCSP}:
+                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, C3_Faster, GSConvns, VoVGSCSP, C3_DSConv}:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, C3_Faster}:
+            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, C3_Faster, C3_DSConv}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is CARAFE:
+            c1, c2 = ch[f], ch[f]
+            args = [c1, c2, *args]
+        elif m in {SEAttention, CBAMBlock, BAMBlock, EfficientChannelAttention, CoordAtt, 
+                   EMA, GAM_Attention, ELA, MHSA, ParNetAttention, 
+                   ParallelPolarizedSelfAttention, SequentialPolarizedSelfAttention,
+                   ShuffleAttention, S2Attention, SKAttention, DoubleAttention,
+                   CoTAttention, LSKblock, LSKA, MLCA, CPCA, CAA,
+                   GlobalContext, EffectiveSEModule, GatherExcite,
+                   MobileViTAttention, BiLevelRoutingAttention, EfficientAttention}:
+            c1, c2 = ch[f], ch[f]
+            args = [c1, *args]
         # TODO: channel, gw, gd
-        elif m in {Detect, Segment}:
+        elif m in {Detect, Segment, Decoupled_Detect}:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)

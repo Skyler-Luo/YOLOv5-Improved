@@ -31,6 +31,26 @@ from utils.general import (LOGGER, ROOT, Profile, check_requirements, check_suff
                            xyxy2xywh, yaml_load)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import copy_attr, smart_inference_mode
+import torch.nn.functional as F
+
+try:
+    from timm.models.layers import DropPath
+except ImportError:
+    class DropPath(nn.Module):
+        def __init__(self, drop_prob: float = 0., scale_by_keep: bool = True):
+            super(DropPath, self).__init__()
+            self.drop_prob = drop_prob
+            self.scale_by_keep = scale_by_keep
+
+        def forward(self, x):
+            if self.drop_prob == 0. or not self.training:
+                return x
+            keep_prob = 1 - self.drop_prob
+            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+            random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+            if keep_prob > 0.0 and self.scale_by_keep:
+                random_tensor.div_(keep_prob)
+            return x * random_tensor
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
@@ -870,7 +890,7 @@ class Classify(nn.Module):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
 
-from timm.models.layers import DropPath
+
 class Partial_conv3(nn.Module):
     def __init__(self, dim, n_div, forward):
         super().__init__()
@@ -1044,3 +1064,73 @@ class VoVGSCSPC(VoVGSCSP):
         super().__init__(c1, c2)
         c_ = int(c2 * 0.5)  # hidden channels
         self.gsb = GSBottleneckC(c_, c_, 1, 1)
+
+
+class DSConv(nn.Module):
+    # Depthwise separable convolution
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        super().__init__()
+        self.dwconv = Conv(c1, c1, k, s, p, g=math.gcd(c1, c1), d=d, act=act)
+        self.pwconv = Conv(c1, c2, 1, 1, 0, g=1, act=act)
+
+    def forward(self, x):
+        return self.pwconv(self.dwconv(x))
+
+
+class Bottleneck_DSConv(nn.Module):
+    # Depthwise separable bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = DSConv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class C3_DSConv(C3):
+    # C3 module with depthwise separable convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(Bottleneck_DSConv(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+
+class CARAFE(nn.Module):
+    # Content-Aware ReAssembly of FEatures upsampling operator
+    def __init__(self, c1, c2, scale_factor=2, k_encoder=3, k_up=5):
+        super(CARAFE, self).__init__()
+        self.c1 = c1
+        self.c2 = c2
+        self.scale_factor = scale_factor
+        self.k_encoder = k_encoder
+        self.k_up = k_up
+        
+        c_mid = max(64, c1 // 4)
+        self.compress = nn.Conv2d(c1, c_mid, 1)
+        self.encoder = nn.Conv2d(c_mid, scale_factor ** 2 * k_up ** 2, k_encoder, padding=k_encoder // 2)
+        self.softmax = nn.Softmax(dim=-1)
+        self.pw = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_compressed = self.compress(x)
+        kernels = self.encoder(x_compressed)
+        kernels = F.pixel_shuffle(kernels, self.scale_factor)
+        kernels = self.softmax(kernels)
+        
+        pad = self.k_up // 2
+        x_pad = F.pad(x, (pad, pad, pad, pad), mode='constant', value=0)
+        unfolded = F.unfold(x_pad, kernel_size=self.k_up, stride=1)
+        unfolded = unfolded.view(B, C, self.k_up * self.k_up, H, W)
+        
+        unfolded_up = F.interpolate(unfolded.view(B, C * self.k_up * self.k_up, H, W), 
+                                    scale_factor=self.scale_factor, 
+                                    mode='nearest')
+        unfolded_up = unfolded_up.view(B, C, self.k_up * self.k_up, H * self.scale_factor, W * self.scale_factor)
+        
+        kernels = kernels.unsqueeze(1)
+        out = torch.sum(unfolded_up * kernels, dim=2)
+        return self.pw(out)
