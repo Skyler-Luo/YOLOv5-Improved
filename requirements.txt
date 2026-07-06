@@ -1,4 +1,4 @@
-# YOLOv5-Lite Requirements
+# YOLOv5-Improved Requirements
 # Base dependencies
 numpy>=1.18.5
 opencv-python>=4.1.1

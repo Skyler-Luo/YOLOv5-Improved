@@ -154,10 +154,8 @@ class Decoupled_Detect(Detect):
                 if self.dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
                     self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
 
-                if self.export:
-                    y = x[i].sigmoid()
-                else:
-                    y = x[i].sigmoid()
+                y = x[i].sigmoid()
+                if not self.export:
                     y[..., 0:2] = (y[..., 0:2] * 2 + self.grid[i]) * self.stride[i]
                     y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]
                 z.append(y.view(bs, self.na * nx * ny, self.no))
@@ -406,10 +404,13 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                    ShuffleAttention, S2Attention, SKAttention, DoubleAttention,
                    CoTAttention, LSKblock, LSKA, MLCA, CPCA, CAA,
                    GlobalContext, EffectiveSEModule, GatherExcite,
-                   MobileViTAttention, BiLevelRoutingAttention, EfficientAttention}:
+                   MobileViTAttention, BiLevelRoutingAttention, EfficientAttention,
+                   DAttention}:
             c1, c2 = ch[f], ch[f]
             args = [c1, *args]
-        # TODO: channel, gw, gd
+        elif m in {SimAM, SpatialGroupEnhance, TripletAttention}:
+            # Parameter-free attention modules (no channel arg needed)
+            c2 = ch[f]
         elif m in {Detect, Segment, Decoupled_Detect}:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors

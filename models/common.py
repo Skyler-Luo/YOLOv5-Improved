@@ -1070,7 +1070,7 @@ class DSConv(nn.Module):
     # Depthwise separable convolution
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         super().__init__()
-        self.dwconv = Conv(c1, c1, k, s, p, g=math.gcd(c1, c1), d=d, act=act)
+        self.dwconv = Conv(c1, c1, k, s, p, g=c1, d=d, act=act)
         self.pwconv = Conv(c1, c2, 1, 1, 0, g=1, act=act)
 
     def forward(self, x):
